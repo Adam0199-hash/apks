@@ -1,33 +1,43 @@
 #!/usr/bin/env python3
 """
-Public file server — browse, download, and upload files via HTTP.
-Run inside your Docker container and expose the port.
+Public file server — browse, download, upload, delete files via HTTP.
+API routes are protected by PW header.
 
 Install: pip install flask
 Run:     python file_server.py
 """
 
 import os
-import re
 import threading
 import urllib.request
-from flask import Flask, request, send_from_directory, jsonify, abort
+from flask import Flask, request, send_from_directory, jsonify, abort, redirect
 from werkzeug.utils import secure_filename
-
-# Track active URL downloads: filename -> {"status", "error"}
-download_jobs = {}
+from functools import wraps
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-FILES_DIR = "./public_files"   # Directory to serve files from
-PORT = 5000                    # Port to listen on
-MAX_FILE_SIZE_MB = 100         # Max upload size in MB
-ALLOWED_EXTENSIONS = None      # Set of extensions e.g. {"jpg","png","pdf"} or None for all
+FILES_DIR       = "./public_files"   # Directory to serve files from
+PORT            = 5000               # Port to listen on
+MAX_FILE_SIZE_MB = 100               # Max upload size in MB
+ALLOWED_EXTENSIONS = None            # e.g. {"jpg","png","pdf"} or None for all
+API_PASSWORD    = "2000AM"           # Required in PW header for all API calls
 # ──────────────────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE_MB * 1024 * 1024
-
 os.makedirs(FILES_DIR, exist_ok=True)
+
+download_jobs = {}  # filename -> {"status", "error"}
+
+
+# ── AUTH ──────────────────────────────────────────────────────────────────────
+def require_pw(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        pw = request.headers.get("PW") or request.args.get("pw")
+        if pw != API_PASSWORD:
+            return jsonify({"error": "Unauthorized — invalid or missing PW header"}), 401
+        return f(*args, **kwargs)
+    return decorated
 
 
 def allowed(filename):
@@ -37,70 +47,367 @@ def allowed(filename):
     return ext in ALLOWED_EXTENSIONS
 
 
+def fmt_size(size):
+    if size >= 1024 * 1024:
+        return f"{size / 1024 / 1024:.1f} MB"
+    elif size >= 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size} B"
+
+
 # ── HTML UI ───────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    files = os.listdir(FILES_DIR)
+    files = sorted(os.listdir(FILES_DIR))
     file_rows = ""
-    for f in sorted(files):
-        size = os.path.getsize(os.path.join(FILES_DIR, f))
-        size_str = f"{size / 1024:.1f} KB" if size >= 1024 else f"{size} B"
+    for f in files:
+        path = os.path.join(FILES_DIR, f)
+        size_str = fmt_size(os.path.getsize(path))
         file_rows += f"""
         <tr>
-          <td><a href="/files/{f}" download>{f}</a></td>
-          <td>{size_str}</td>
-          <td><a href="/files/{f}" download>⬇ Download</a></td>
+          <td class="fname">
+            <span class="icon">📄</span>
+            <a href="/files/{f}" download>{f}</a>
+          </td>
+          <td class="fsize">{size_str}</td>
+          <td class="actions">
+            <a class="btn btn-dl" href="/files/{f}" download>⬇ Download</a>
+            <button class="btn btn-del" onclick="deleteFile('{f}')">🗑 Delete</button>
+          </td>
         </tr>"""
 
+    empty_row = '<tr><td colspan="3" class="empty">No files yet. Upload one below!</td></tr>'
+
     return f"""<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title>File Server</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>📁 File Server</title>
   <style>
-    body {{ font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }}
-    h1 {{ color: #333; }}
-    table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-    th, td {{ padding: 10px; border: 1px solid #ddd; text-align: left; }}
-    th {{ background: #f5f5f5; }}
-    a {{ color: #0070f3; text-decoration: none; }}
-    a:hover {{ text-decoration: underline; }}
-    .upload {{ margin-top: 30px; padding: 20px; border: 2px dashed #ccc; border-radius: 8px; }}
-    input[type=file] {{ margin: 10px 0; }}
-    button {{ background: #0070f3; color: white; border: none; padding: 8px 20px;
-              border-radius: 5px; cursor: pointer; font-size: 14px; }}
-    button:hover {{ background: #0051a8; }}
-    .empty {{ color: #999; font-style: italic; }}
+    :root {{
+      --bg: #f4f6fb;
+      --surface: #ffffff;
+      --border: #e2e8f0;
+      --text: #1a202c;
+      --muted: #718096;
+      --accent: #4f46e5;
+      --accent-hover: #3730a3;
+      --danger: #e53e3e;
+      --danger-hover: #c53030;
+      --success: #38a169;
+      --shadow: 0 2px 12px rgba(0,0,0,0.08);
+      --radius: 12px;
+    }}
+    [data-theme="dark"] {{
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --border: #2d3148;
+      --text: #e2e8f0;
+      --muted: #a0aec0;
+      --accent: #7c70f5;
+      --accent-hover: #6558f0;
+      --danger: #fc8181;
+      --danger-hover: #f56565;
+      --shadow: 0 2px 16px rgba(0,0,0,0.4);
+    }}
+
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      transition: background 0.3s, color 0.3s;
+    }}
+
+    /* ── TOP BAR ── */
+    header {{
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: var(--shadow);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }}
+    header h1 {{ font-size: 1.3rem; font-weight: 700; letter-spacing: -0.3px; }}
+    .header-actions {{ display: flex; gap: 10px; align-items: center; }}
+
+    .toggle-btn {{
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 7px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 500;
+      transition: all 0.2s;
+    }}
+    .toggle-btn:hover {{ border-color: var(--accent); color: var(--accent); }}
+
+    /* ── LAYOUT ── */
+    .container {{
+      max-width: 960px;
+      margin: 32px auto;
+      padding: 0 20px;
+    }}
+    @media (max-width: 600px) {{
+      .container {{ margin: 16px auto; padding: 0 12px; }}
+      header {{ padding: 12px 16px; }}
+      header h1 {{ font-size: 1.1rem; }}
+    }}
+
+    /* ── CARDS ── */
+    .card {{
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      margin-bottom: 20px;
+      overflow: hidden;
+    }}
+    .card-header {{
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+      font-size: 0.95rem;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }}
+
+    /* ── TABLE ── */
+    table {{ width: 100%; border-collapse: collapse; }}
+    th {{
+      padding: 11px 16px;
+      text-align: left;
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--muted);
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+    }}
+    td {{
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.9rem;
+      vertical-align: middle;
+    }}
+    tr:last-child td {{ border-bottom: none; }}
+    tr:hover td {{ background: var(--bg); }}
+
+    .fname {{ display: flex; align-items: center; gap: 8px; }}
+    .fname a {{ color: var(--accent); text-decoration: none; font-weight: 500; word-break: break-all; }}
+    .fname a:hover {{ text-decoration: underline; }}
+    .icon {{ font-size: 1.1rem; flex-shrink: 0; }}
+    .fsize {{ color: var(--muted); font-size: 0.82rem; white-space: nowrap; }}
+    .actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    .empty {{ text-align: center; color: var(--muted); padding: 32px; font-style: italic; }}
+
+    /* ── BUTTONS ── */
+    .btn {{
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 6px 12px;
+      border-radius: 7px;
+      font-size: 0.8rem;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      text-decoration: none;
+      transition: all 0.15s;
+      white-space: nowrap;
+    }}
+    .btn-dl {{ background: var(--accent); color: #fff; }}
+    .btn-dl:hover {{ background: var(--accent-hover); }}
+    .btn-del {{ background: transparent; border: 1px solid var(--danger); color: var(--danger); }}
+    .btn-del:hover {{ background: var(--danger); color: #fff; }}
+    .btn-primary {{
+      background: var(--accent); color: #fff;
+      padding: 9px 20px; font-size: 0.9rem; border-radius: 8px;
+      margin-top: 12px;
+    }}
+    .btn-primary:hover {{ background: var(--accent-hover); }}
+
+    /* ── FORMS ── */
+    .form-body {{ padding: 20px; display: flex; flex-direction: column; gap: 14px; }}
+    .form-row {{ display: flex; flex-direction: column; gap: 5px; }}
+    label {{ font-size: 0.85rem; font-weight: 500; color: var(--muted); }}
+    input[type=text], input[type=url], input[type=file] {{
+      width: 100%;
+      padding: 9px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 0.9rem;
+      transition: border-color 0.2s;
+      outline: none;
+    }}
+    input:focus {{ border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79,70,229,0.15); }}
+    .hint {{ font-size: 0.78rem; color: var(--muted); }}
+
+    /* ── TOAST ── */
+    #toast {{
+      position: fixed; bottom: 24px; right: 24px;
+      background: #1a202c; color: #fff;
+      padding: 12px 20px; border-radius: 10px;
+      font-size: 0.88rem; box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.3s;
+      z-index: 999;
+    }}
+    #toast.show {{ opacity: 1; }}
+    #toast.ok {{ background: var(--success); }}
+    #toast.err {{ background: var(--danger); }}
+
+    /* ── API DOCS ── */
+    .api-docs {{ padding: 16px 20px; font-size: 0.82rem; color: var(--muted); line-height: 1.8; }}
+    code {{
+      background: var(--bg); border: 1px solid var(--border);
+      padding: 1px 6px; border-radius: 4px;
+      font-family: 'SF Mono', monospace; font-size: 0.8rem; color: var(--accent);
+    }}
+
+    /* ── RESPONSIVE TABLE ── */
+    @media (max-width: 520px) {{
+      th.fsize-th, td.fsize {{ display: none; }}
+      .actions {{ flex-direction: column; }}
+      .btn {{ font-size: 0.75rem; padding: 5px 10px; }}
+    }}
   </style>
 </head>
 <body>
-  <h1>📁 File Server</h1>
+  <header>
+    <h1>📁 File Server</h1>
+    <div class="header-actions">
+      <button class="toggle-btn" onclick="toggleTheme()" id="themeBtn">🌙 Dark</button>
+    </div>
+  </header>
 
-  <table>
-    <thead><tr><th>Filename</th><th>Size</th><th>Action</th></tr></thead>
-    <tbody>
-      {''.join([file_rows]) if files else '<tr><td colspan="3" class="empty">No files yet.</td></tr>'}
-    </tbody>
-  </table>
+  <div class="container">
 
-  <div class="upload">
-    <h3>⬆ Upload a File</h3>
-    <form action="/upload" method="post" enctype="multipart/form-data">
-      <input type="file" name="file" required><br>
-      <button type="submit">Upload</button>
-    </form>
+    <!-- File list -->
+    <div class="card">
+      <div class="card-header">🗂 Files</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Filename</th>
+            <th class="fsize-th">Size</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="fileTable">
+          {file_rows if files else empty_row}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Upload -->
+    <div class="card">
+      <div class="card-header">⬆ Upload a File</div>
+      <form class="form-body" action="/upload" method="post" enctype="multipart/form-data">
+        <div class="form-row">
+          <label>Choose file</label>
+          <input type="file" name="file" required>
+        </div>
+        <div><button class="btn btn-primary" type="submit">Upload</button></div>
+      </form>
+    </div>
+
+    <!-- Fetch from URL -->
+    <div class="card">
+      <div class="card-header">🔗 Fetch from URL</div>
+      <form class="form-body" action="/fetch-url" method="post">
+        <div class="form-row">
+          <label>URL</label>
+          <input type="url" name="url" placeholder="https://example.com/file.zip" required>
+        </div>
+        <div class="form-row">
+          <label>Custom filename <span class="hint">(optional — leave blank to use name from URL)</span></label>
+          <input type="text" name="filename" placeholder="my-file.zip">
+        </div>
+        <div><button class="btn btn-primary" type="submit">Fetch File</button></div>
+      </form>
+    </div>
+
+    <!-- API Docs -->
+    <div class="card">
+      <div class="card-header">🔌 API Reference</div>
+      <div class="api-docs">
+        All API requests require header: <code>PW: 2000AM</code><br><br>
+        <code>GET  /api/files</code> — list all files<br>
+        <code>GET  /files/&lt;name&gt;</code> — download a file<br>
+        <code>POST /upload</code> — upload a file (multipart)<br>
+        <code>POST /fetch-url</code> — fetch file from URL (JSON body: url, filename?)<br>
+        <code>GET  /fetch-status/&lt;name&gt;</code> — check URL fetch progress<br>
+        <code>DELETE /api/delete/&lt;name&gt;</code> — delete a file
+      </div>
+    </div>
+
   </div>
 
-  <div class="upload" style="margin-top:20px;">
-    <h3>🔗 Download from URL</h3>
-    <form action="/fetch-url" method="post">
-      <input type="url" name="url" placeholder="https://example.com/file.zip"
-             required style="width:70%; padding:8px; border:1px solid #ccc; border-radius:5px;">
-      <button type="submit" style="margin-left:8px;">Fetch</button>
-    </form>
-  </div>
+  <div id="toast"></div>
 
-  <hr style="margin-top:30px">
-  <small>API: <code>GET /api/files</code> · <code>GET /files/&lt;name&gt;</code> · <code>POST /upload</code> · <code>POST /fetch-url</code></small>
+  <script>
+    // ── THEME ──
+    const saved = localStorage.getItem('theme') || 'light';
+    setTheme(saved);
+
+    function setTheme(t) {{
+      document.documentElement.setAttribute('data-theme', t);
+      document.getElementById('themeBtn').textContent = t === 'dark' ? '☀️ Light' : '🌙 Dark';
+      localStorage.setItem('theme', t);
+    }}
+    function toggleTheme() {{
+      const cur = document.documentElement.getAttribute('data-theme');
+      setTheme(cur === 'dark' ? 'light' : 'dark');
+    }}
+
+    // ── TOAST ──
+    function toast(msg, type = 'ok') {{
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.className = 'show ' + type;
+      setTimeout(() => t.className = '', 3000);
+    }}
+
+    // ── DELETE ──
+    async function deleteFile(filename) {{
+      if (!confirm(`Delete "${{filename}}"? This cannot be undone.`)) return;
+      const res = await fetch(`/api/delete/${{encodeURIComponent(filename)}}`, {{
+        method: 'DELETE',
+        headers: {{ 'PW': '2000AM' }}
+      }});
+      const data = await res.json();
+      if (res.ok) {{
+        toast(`✅ "${{filename}}" deleted`);
+        // Remove row from table
+        const rows = document.querySelectorAll('#fileTable tr');
+        rows.forEach(row => {{
+          if (row.querySelector('a') && row.querySelector('a').textContent.trim() === filename) {{
+            row.remove();
+          }}
+        }});
+        if (document.querySelectorAll('#fileTable tr').length === 0) {{
+          document.getElementById('fileTable').innerHTML =
+            '<tr><td colspan="3" class="empty">No files yet. Upload one below!</td></tr>';
+        }}
+      }} else {{
+        toast(`❌ ${{data.error || 'Delete failed'}}`, 'err');
+      }}
+    }}
+  </script>
 </body>
 </html>"""
 
@@ -116,28 +423,32 @@ def download(filename):
 def upload():
     if "file" not in request.files:
         abort(400, "No file part in request.")
-
     file = request.files["file"]
     if file.filename == "":
         abort(400, "No file selected.")
-
     if not allowed(file.filename):
-        abort(400, f"File type not allowed.")
-
+        abort(400, "File type not allowed.")
     filename = secure_filename(file.filename)
-    save_path = os.path.join(FILES_DIR, filename)
-    file.save(save_path)
-
-    # Redirect back to UI if browser request, else return JSON
+    file.save(os.path.join(FILES_DIR, filename))
     if request.accept_mimetypes.accept_html:
-        from flask import redirect
         return redirect("/")
     return jsonify({"status": "ok", "filename": filename}), 201
 
 
+# ── DELETE ────────────────────────────────────────────────────────────────────
+@app.route("/api/delete/<filename>", methods=["DELETE"])
+@require_pw
+def delete_file(filename):
+    filename = secure_filename(filename)
+    path = os.path.join(FILES_DIR, filename)
+    if not os.path.isfile(path):
+        return jsonify({"error": "File not found"}), 404
+    os.remove(path)
+    return jsonify({"status": "deleted", "filename": filename})
+
+
 # ── FETCH FROM URL ────────────────────────────────────────────────────────────
 def _do_download(url: str, save_path: str, filename: str):
-    """Download a URL to disk in a background thread."""
     try:
         urllib.request.urlretrieve(url, save_path)
         download_jobs[filename] = {"status": "done"}
@@ -151,23 +462,24 @@ def fetch_url():
     if not url:
         abort(400, "No URL provided.")
 
-    # Derive filename from URL
-    filename = secure_filename(url.split("?")[0].rstrip("/").split("/")[-1]) or "download"
-    save_path = os.path.join(FILES_DIR, filename)
+    custom_name = request.form.get("filename") or (request.json or {}).get("filename", "")
+    if custom_name:
+        filename = secure_filename(custom_name)
+    else:
+        filename = secure_filename(url.split("?")[0].rstrip("/").split("/")[-1]) or "download"
 
+    save_path = os.path.join(FILES_DIR, filename)
     download_jobs[filename] = {"status": "downloading"}
-    thread = threading.Thread(target=_do_download, args=(url, save_path, filename), daemon=True)
-    thread.start()
+    threading.Thread(target=_do_download, args=(url, save_path, filename), daemon=True).start()
 
     if request.accept_mimetypes.accept_html:
-        from flask import redirect
-        return f"""<!DOCTYPE html><html><head><title>Downloading…</title>
+        return f"""<!DOCTYPE html><html><head><title>Fetching…</title>
         <meta http-equiv="refresh" content="3;url=/">
-        </head><body style="font-family:sans-serif;max-width:600px;margin:60px auto;text-align:center">
-        <h2>⏳ Downloading <code>{filename}</code>…</h2>
-        <p>You'll be redirected back in a few seconds.<br>
-        Refresh the main page to see the file once it's done.</p>
-        <a href="/">← Back</a>
+        <style>body{{font-family:sans-serif;max-width:500px;margin:80px auto;text-align:center;color:#1a202c}}</style>
+        </head><body>
+        <h2>⏳ Fetching <code>{filename}</code>…</h2>
+        <p>Redirecting back in a moment. Refresh the page if the file doesn't appear.</p>
+        <a href="/">← Back now</a>
         </body></html>"""
     return jsonify({"status": "downloading", "filename": filename}), 202
 
@@ -180,8 +492,9 @@ def fetch_status(filename):
     return jsonify(job)
 
 
-# ── API: list files ───────────────────────────────────────────────────────────
+# ── API: LIST FILES ───────────────────────────────────────────────────────────
 @app.route("/api/files")
+@require_pw
 def api_list():
     files = []
     for f in os.listdir(FILES_DIR):
@@ -189,12 +502,13 @@ def api_list():
         files.append({
             "name": f,
             "size_bytes": os.path.getsize(path),
+            "size": fmt_size(os.path.getsize(path)),
             "url": f"/files/{f}"
         })
     return jsonify(files)
 
 
 if __name__ == "__main__":
-    print(f"Serving files from: {os.path.abspath(FILES_DIR)}")
-    print(f"Open: http://localhost:{PORT}")
+    print(f"📁 Serving files from: {os.path.abspath(FILES_DIR)}")
+    print(f"🌐 Open: http://localhost:{PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
