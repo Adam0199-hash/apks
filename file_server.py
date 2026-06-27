@@ -8,8 +8,14 @@ Run:     python file_server.py
 """
 
 import os
+import re
+import threading
+import urllib.request
 from flask import Flask, request, send_from_directory, jsonify, abort
 from werkzeug.utils import secure_filename
+
+# Track active URL downloads: filename -> {"status", "error"}
+download_jobs = {}
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 FILES_DIR = "./public_files"   # Directory to serve files from
@@ -84,8 +90,17 @@ def index():
     </form>
   </div>
 
+  <div class="upload" style="margin-top:20px;">
+    <h3>🔗 Download from URL</h3>
+    <form action="/fetch-url" method="post">
+      <input type="url" name="url" placeholder="https://example.com/file.zip"
+             required style="width:70%; padding:8px; border:1px solid #ccc; border-radius:5px;">
+      <button type="submit" style="margin-left:8px;">Fetch</button>
+    </form>
+  </div>
+
   <hr style="margin-top:30px">
-  <small>API: <code>GET /api/files</code> · <code>GET /files/&lt;name&gt;</code> · <code>POST /upload</code></small>
+  <small>API: <code>GET /api/files</code> · <code>GET /files/&lt;name&gt;</code> · <code>POST /upload</code> · <code>POST /fetch-url</code></small>
 </body>
 </html>"""
 
@@ -118,6 +133,51 @@ def upload():
         from flask import redirect
         return redirect("/")
     return jsonify({"status": "ok", "filename": filename}), 201
+
+
+# ── FETCH FROM URL ────────────────────────────────────────────────────────────
+def _do_download(url: str, save_path: str, filename: str):
+    """Download a URL to disk in a background thread."""
+    try:
+        urllib.request.urlretrieve(url, save_path)
+        download_jobs[filename] = {"status": "done"}
+    except Exception as e:
+        download_jobs[filename] = {"status": "error", "error": str(e)}
+
+
+@app.route("/fetch-url", methods=["POST"])
+def fetch_url():
+    url = request.form.get("url") or (request.json or {}).get("url", "")
+    if not url:
+        abort(400, "No URL provided.")
+
+    # Derive filename from URL
+    filename = secure_filename(url.split("?")[0].rstrip("/").split("/")[-1]) or "download"
+    save_path = os.path.join(FILES_DIR, filename)
+
+    download_jobs[filename] = {"status": "downloading"}
+    thread = threading.Thread(target=_do_download, args=(url, save_path, filename), daemon=True)
+    thread.start()
+
+    if request.accept_mimetypes.accept_html:
+        from flask import redirect
+        return f"""<!DOCTYPE html><html><head><title>Downloading…</title>
+        <meta http-equiv="refresh" content="3;url=/">
+        </head><body style="font-family:sans-serif;max-width:600px;margin:60px auto;text-align:center">
+        <h2>⏳ Downloading <code>{filename}</code>…</h2>
+        <p>You'll be redirected back in a few seconds.<br>
+        Refresh the main page to see the file once it's done.</p>
+        <a href="/">← Back</a>
+        </body></html>"""
+    return jsonify({"status": "downloading", "filename": filename}), 202
+
+
+@app.route("/fetch-status/<filename>")
+def fetch_status(filename):
+    job = download_jobs.get(filename)
+    if not job:
+        return jsonify({"status": "unknown"}), 404
+    return jsonify(job)
 
 
 # ── API: list files ───────────────────────────────────────────────────────────
